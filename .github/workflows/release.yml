@@ -1,0 +1,74 @@
+name: Test and release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run tests
+        run: node --test tests/*.test.js
+
+      - name: Check JavaScript syntax and manifest
+        run: |
+          node --check main.js
+          node --check library.js
+          node -e "JSON.parse(require('node:fs').readFileSync('manifest.json', 'utf8'))"
+
+  release:
+    name: Build and publish release
+    needs: test
+    if: >-
+      startsWith(github.event.head_commit.message, '[Major]') ||
+      startsWith(github.event.head_commit.message, '[Minor]') ||
+      startsWith(github.event.head_commit.message, '[Patch]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Calculate release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_tag="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          commit_subject="$(git log -1 --format=%s "$GITHUB_SHA")"
+          version="$(python3 scripts/release_version.py "$commit_subject" "$latest_tag" manifest.json)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build ZIP and CCX packages
+        run: python3 scripts/build_release.py "${{ steps.version.outputs.version }}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$version" \
+            "dist/bgm-finder-${version}.zip" \
+            "dist/bgm-finder-${version}.ccx" \
+            --title "BGM Finder ${version}" \
+            --generate-notes
