@@ -141,9 +141,48 @@ function renderTracks() {
 }
 
 async function collectProjectAudioItems(folder, collectedTracks) {
-  const items = await folder.getItems();
+  await collectProjectItems(await folder.getItems(), collectedTracks);
+}
+
+async function collectProjectItems(items, collectedTracks) {
   for (const item of items) {
-    const contentType = await item.getContentType();
+    const itemType = item.type;
+    const projectItemTypes = premiere.Constants.ProjectItemType;
+    let childItems;
+    let folderCastError;
+
+    if (
+      projectItemTypes
+      && (itemType === projectItemTypes.ROOT || itemType === projectItemTypes.BIN)
+    ) {
+      childItems = await premiere.FolderItem.cast(item).getItems();
+    } else if (!itemType) {
+      try {
+        childItems = await premiere.FolderItem.cast(item).getItems();
+      } catch (error) {
+        folderCastError = error;
+      }
+    }
+
+    if (childItems !== undefined) {
+      await collectProjectItems(childItems, collectedTracks);
+      continue;
+    }
+
+    let contentType;
+    try {
+      contentType = await premiere.ClipProjectItem.cast(item).getContentType();
+    } catch (error) {
+      if (folderCastError) {
+        throw new Error(
+          `プロジェクト項目をフォルダーまたは素材として判定できませんでした: ${
+            getErrorMessage(folderCastError)
+          }; ${getErrorMessage(error)}`
+        );
+      }
+      throw error;
+    }
+
     if (contentType === premiere.Constants.ContentType.MEDIA) {
       let path = "";
       let restoreError = null;
@@ -171,8 +210,6 @@ async function collectProjectAudioItems(folder, collectedTracks) {
         )?.tags ?? [],
         restoreError
       });
-    } else if (contentType === premiere.Constants.ContentType.ANY) {
-      await collectProjectAudioItems(premiere.FolderItem.cast(item), collectedTracks);
     }
   }
 }
