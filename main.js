@@ -1,8 +1,16 @@
 const fs = require("uxp").storage.localFileSystem;
-const { filterTracks, parseTags } = require("./library");
+const premiere = require("premierepro");
+const {
+  fileNameFromPath,
+  filterTracks,
+  isAudioFileName,
+  normalizeLibrary,
+  parseTags,
+  setFileTags
+} = require("./library");
 
 const audioPlayer = document.getElementById("audio-player");
-const addTracksButton = document.getElementById("add-tracks");
+const refreshProjectButton = document.getElementById("refresh-project");
 const nowPlaying = document.getElementById("now-playing");
 const resultCount = document.getElementById("result-count");
 const searchInput = document.getElementById("tag-search");
@@ -10,7 +18,8 @@ const statusMessage = document.getElementById("status");
 const trackList = document.getElementById("track-list");
 
 let dataFolder;
-let tracks = [];
+let library = { version: 1, tracks: [] };
+let projectTracks = [];
 
 function showStatus(message, isError = false) {
   statusMessage.textContent = message;
@@ -23,14 +32,15 @@ function getErrorMessage(error) {
 
 async function saveLibrary() {
   const file = await dataFolder.createFile("library.json", { overwrite: true });
-  const savedTracks = tracks.map(({ id, name, path, token, tags }) => ({
-    id,
-    name,
-    path,
-    token,
-    tags
-  }));
-  await file.write(JSON.stringify(savedTracks));
+  await file.write(JSON.stringify(library));
+}
+
+function toFileUrl(path) {
+  const normalizedPath = path.replace(/\\/g, "/");
+  const encodedPath = normalizedPath.split("/").map((segment) => (
+    /^[a-zA-Z]:$/.test(segment) ? segment : encodeURIComponent(segment)
+  )).join("/");
+  return `file:${encodedPath.startsWith("/") ? encodedPath : `/${encodedPath}`}`;
 }
 
 function createTrackCard(track) {
@@ -45,11 +55,12 @@ function createTrackCard(track) {
   name.textContent = track.name;
   name.title = track.name;
   header.append(name);
-  let unavailableNote;
+
   if (track.restoreError) {
-    unavailableNote = document.createElement("p");
+    const unavailableNote = document.createElement("p");
     unavailableNote.className = "file-warning";
-    unavailableNote.textContent = `音源を開けません: ${track.restoreError}`;
+    unavailableNote.textContent = `素材のパスを取得できません: ${track.restoreError}`;
+    card.append(unavailableNote);
   }
 
   const tagSection = document.createElement("div");
@@ -72,16 +83,17 @@ function createTrackCard(track) {
   const previewButton = document.createElement("button");
   previewButton.type = "button";
   previewButton.textContent = "プレビュー";
-  previewButton.disabled = !track.entry;
+  previewButton.disabled = !track.path;
   previewButton.addEventListener("click", async () => {
-    if (!track.entry) {
-      showStatus("この音源にアクセスできません。音源を再登録してください。", true);
+    if (!track.path) {
+      showStatus("この素材のパスにアクセスできません。", true);
       return;
     }
 
-    audioPlayer.src = track.entry.url;
-    nowPlaying.textContent = `再生中: ${track.name}`;
     try {
+      const entry = await fs.getEntryWithUrl(toFileUrl(track.path));
+      audioPlayer.src = entry.url;
+      nowPlaying.textContent = `再生中: ${track.name}`;
       await audioPlayer.play();
       showStatus("");
     } catch (error) {
@@ -93,60 +105,33 @@ function createTrackCard(track) {
   saveTagsButton.type = "button";
   saveTagsButton.textContent = "タグを保存";
   saveTagsButton.addEventListener("click", async () => {
-    const previousTags = track.tags;
-    track.tags = parseTags(tagInput.value);
+    const previousLibrary = library;
+    library = setFileTags(library, track.fileName, parseTags(tagInput.value));
     try {
       await saveLibrary();
       renderTracks();
       showStatus("タグを保存しました。");
     } catch (error) {
-      track.tags = previousTags;
+      library = previousLibrary;
       showStatus(`タグを保存できませんでした: ${getErrorMessage(error)}`, true);
     }
   });
 
-  const removeButton = document.createElement("button");
-  removeButton.className = "remove-button";
-  removeButton.type = "button";
-  removeButton.textContent = "削除";
-  removeButton.addEventListener("click", async () => {
-    const previousTracks = tracks;
-    tracks = tracks.filter((item) => item.id !== track.id);
-    try {
-      await saveLibrary();
-      if (audioPlayer.src === track.entry?.url) {
-        audioPlayer.pause();
-        audioPlayer.removeAttribute("src");
-        audioPlayer.load();
-        nowPlaying.textContent = "プレビューする音源を選択してください";
-      }
-      renderTracks();
-      showStatus("音源をライブラリから削除しました。");
-    } catch (error) {
-      tracks = previousTracks;
-      showStatus(`音源を削除できませんでした: ${getErrorMessage(error)}`, true);
-    }
-  });
-
-  actions.append(previewButton, saveTagsButton, removeButton);
-  card.append(header);
-  if (unavailableNote) {
-    card.append(unavailableNote);
-  }
-  card.append(tagSection, actions);
+  actions.append(previewButton, saveTagsButton);
+  card.append(header, tagSection, actions);
   return card;
 }
 
 function renderTracks() {
-  const visibleTracks = filterTracks(tracks, searchInput.value);
+  const visibleTracks = filterTracks(projectTracks, searchInput.value);
   trackList.replaceChildren();
   resultCount.textContent = `${visibleTracks.length}曲`;
 
   if (visibleTracks.length === 0) {
     const emptyState = document.createElement("li");
     emptyState.className = "empty-state";
-    emptyState.textContent = tracks.length === 0
-      ? "「音源を追加」からBGMを登録してください。"
+    emptyState.textContent = projectTracks.length === 0
+      ? "開いているプロジェクトに音源がありません。"
       : "条件に一致する音源はありません。";
     trackList.append(emptyState);
     return;
@@ -155,53 +140,69 @@ function renderTracks() {
   visibleTracks.forEach((track) => trackList.append(createTrackCard(track)));
 }
 
-async function addTracks() {
-  try {
-    const files = await fs.getFileForOpening({
-      allowMultiple: true,
-      types: ["mp3", "wav", "m4a", "aac", "aiff", "flac", "ogg"]
-    });
-    if (!files || files.length === 0) {
-      return;
-    }
-
-    const updatedTracks = [...tracks];
-    for (const file of files) {
-      const token = await fs.createPersistentToken(file);
-      const existingIndex = updatedTracks.findIndex((track) => track.path === file.nativePath);
-      if (existingIndex >= 0) {
-        updatedTracks[existingIndex] = {
-          ...updatedTracks[existingIndex],
-          name: file.name,
-          path: file.nativePath,
-          token,
-          entry: file,
-          restoreError: null
-        };
-      } else {
-        updatedTracks.push({
-          id: `${Date.now()}-${updatedTracks.length}`,
-          name: file.name,
-          path: file.nativePath,
-          token,
-          tags: [],
-          entry: file
-        });
+async function collectProjectAudioItems(folder, collectedTracks) {
+  const items = await folder.getItems();
+  for (const item of items) {
+    const contentType = await item.getContentType();
+    if (contentType === premiere.Constants.ContentType.MEDIA) {
+      let path = "";
+      let restoreError = null;
+      try {
+        path = await premiere.ClipProjectItem.cast(item).getMediaFilePath();
+        if (!path) {
+          restoreError = "Premiere Proからファイルパスが返されませんでした。";
+        }
+      } catch (error) {
+        restoreError = getErrorMessage(error);
       }
+
+      const fileName = fileNameFromPath(path || item.name);
+      if (!isAudioFileName(fileName)) {
+        continue;
+      }
+
+      collectedTracks.push({
+        id: item.getId(),
+        name: item.name || fileName,
+        fileName,
+        path,
+        tags: library.tracks.find(
+          (entry) => entry.fileName.toLowerCase() === fileName.toLowerCase()
+        )?.tags ?? [],
+        restoreError
+      });
+    } else if (contentType === premiere.Constants.ContentType.ANY) {
+      await collectProjectAudioItems(premiere.FolderItem.cast(item), collectedTracks);
+    }
+  }
+}
+
+async function refreshProject() {
+  refreshProjectButton.disabled = true;
+  showStatus("現在のプロジェクトから音源を検索しています。");
+  try {
+    const project = await premiere.Project.getActiveProject();
+    if (!project) {
+      throw new Error("開いているプロジェクトがありません。");
     }
 
-    const previousTracks = tracks;
-    tracks = updatedTracks;
-    try {
-      await saveLibrary();
-    } catch (error) {
-      tracks = previousTracks;
-      throw error;
-    }
+    const root = await project.getRootItem();
+    const updatedTracks = [];
+    await collectProjectAudioItems(root, updatedTracks);
+    projectTracks = updatedTracks;
     renderTracks();
-    showStatus(`${files.length}件の音源を登録しました。`);
+
+    const unavailableCount = projectTracks.filter((track) => track.restoreError).length;
+    const suffix = unavailableCount > 0
+      ? `（${unavailableCount}件の素材パスを取得できませんでした）`
+      : "";
+    showStatus(`プロジェクト内の音源を${projectTracks.length}件読み込みました。${suffix}`, unavailableCount > 0);
   } catch (error) {
-    showStatus(`音源を追加できませんでした: ${getErrorMessage(error)}`, true);
+    projectTracks = [];
+    renderTracks();
+    showStatus(`プロジェクト内の音源を検索できませんでした: ${getErrorMessage(error)}`, true);
+  } finally {
+    refreshProjectButton.disabled = false;
   }
 }
 
@@ -209,53 +210,23 @@ async function loadLibrary() {
   dataFolder = await fs.getDataFolder();
   const entries = await dataFolder.getEntries();
   const libraryFile = entries.find((entry) => entry.isFile && entry.name === "library.json");
-  if (!libraryFile) {
-    renderTracks();
-    showStatus("音源を追加して、曲ごとにタグを設定してください。");
-    return;
-  }
-
-  const storedTracks = JSON.parse(await libraryFile.read());
-  if (!Array.isArray(storedTracks) || storedTracks.some((track) => (
-    typeof track.id !== "string"
-    || typeof track.name !== "string"
-    || typeof track.path !== "string"
-    || typeof track.token !== "string"
-    || !Array.isArray(track.tags)
-    || track.tags.some((tag) => typeof tag !== "string")
-  ))) {
-    throw new Error("ライブラリの保存データが不正です。");
-  }
-
-  const restoreErrors = [];
-  tracks = await Promise.all(storedTracks.map(async (track) => {
-    try {
-      const entry = await fs.getEntryForPersistentToken(track.token);
-      return { ...track, entry };
-    } catch (error) {
-      const restoreError = getErrorMessage(error);
-      restoreErrors.push(restoreError);
-      return { ...track, entry: null, restoreError };
+  if (libraryFile) {
+    const storedLibrary = JSON.parse(await libraryFile.read());
+    library = normalizeLibrary(storedLibrary);
+    if (Array.isArray(storedLibrary)) {
+      await saveLibrary();
     }
-  }));
-  renderTracks();
-
-  if (restoreErrors.length > 0) {
-    showStatus(
-      `${restoreErrors.length}件の音源にアクセスできません。再登録するか、削除してください。(${restoreErrors[0]})`,
-      true
-    );
-  } else {
-    showStatus("ライブラリを読み込みました。");
   }
+
+  await refreshProject();
 }
 
-addTracksButton.addEventListener("click", addTracks);
+refreshProjectButton.addEventListener("click", refreshProject);
 searchInput.addEventListener("input", renderTracks);
 audioPlayer.addEventListener("error", () => {
   showStatus("音源を再生できません。ファイルの場所と形式を確認してください。", true);
 });
 
 loadLibrary().catch((error) => {
-  showStatus(`ライブラリを読み込めませんでした: ${getErrorMessage(error)}`, true);
+  showStatus(`タグ情報を読み込めませんでした: ${getErrorMessage(error)}`, true);
 });
